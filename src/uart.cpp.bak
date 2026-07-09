@@ -1,0 +1,23 @@
+
+#include <Arduino.h>
+
+#define GPS_RX 5
+#define GPS_TX 4
+#define GPS_BAUD 115200
+
+HardwareSerial F9P_uart(2);
+
+void setup()
+{
+    Serial.begin(115200);
+    F9P_uart.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+}
+
+void loop()
+{
+    while (F9P_uart.available())
+        Serial.write(F9P_uart.read());
+
+    while (Serial.available())
+        F9P_uart.write(Serial.read());
+}
