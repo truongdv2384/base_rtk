@@ -14,10 +14,10 @@
 #define GPS_TX 4
 #define GPS_BAUD 115200
 
-#define MODEM_RX 11
-#define MODEM_TX 10
+#define MODEM_RX 9
+#define MODEM_TX 8
 
-#define SURVEY_PIN 8
+#define SURVEY_PIN 10
 #define LED_SURVEY_IN 11
 #define LED_PING 7
 
