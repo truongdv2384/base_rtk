@@ -24,7 +24,8 @@ void MqttCmd::subscribe()
 
 void MqttCmd::_callback(char *topic, byte *payload, unsigned int length)
 {
-    char buf[32];
+    // Du cho lenh OTA kem manifest JSON (url + size + sha256 ~ 200 byte).
+    char buf[320];
     unsigned int n = length < sizeof(buf) - 1 ? length : sizeof(buf) - 1;
     memcpy(buf, payload, n);
     buf[n] = 0;
@@ -36,8 +37,17 @@ void MqttCmd::_callback(char *topic, byte *payload, unsigned int length)
         size_t clen = strlen(_entries[i].cmd);
         if (strncmp(buf, _entries[i].cmd, clen) == 0)
         {
-            if (_entries[i].fn)
+            if (_entries[i].dfn)
+            {
+                const char *arg = buf + clen;
+                while (*arg == ' ')
+                    arg++;
+                _entries[i].dfn(arg, strlen(arg));
+            }
+            else if (_entries[i].fn)
+            {
                 _entries[i].fn();
+            }
             return;
         }
     }

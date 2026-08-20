@@ -1,0 +1,7 @@
+{
+  "name": "OtaCommon",
+  "version": "0.1.0",
+  "description": "OTA dung chung: rollback self-test (verifyRollbackLater override) + SHA-256 helper",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"]
+}

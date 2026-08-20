@@ -7,11 +7,15 @@ class MqttCmd
 {
 public:
     using Handler = void (*)();
+    // Handler nhan phan payload CON LAI sau tu khoa lenh (da bo khoang trang
+    // dau). Dung cho lenh mang tham so, vd: OTA {"url":...}
+    using DataHandler = void (*)(const char *arg, size_t len);
 
     struct Entry
     {
         const char *cmd;
-        Handler fn;
+        Handler fn;      // lenh khong tham so
+        DataHandler dfn; // lenh co tham so (de nullptr neu khong dung)
     };
 
     static void begin(PubSubClient &mqtt, const char *topic,

@@ -2,14 +2,25 @@
 #define TINY_GSM_MODEM_BG96
 
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <PubSubClient.h>
-#include <TinyGsmClient.h>
 #include <serial_log.h>
 #include <mqtt_cmd.h>
-#include "icon.h"
+#include <ota_rtk.h>
+#include <ota_selftest.h>
+#include "net_mode.h" // NET_MODE_GSM / NET_MODE_WIFI / NET_MODE_AUTO
+
+#if NET_HAS_GSM
+#include <TinyGsmClient.h>
+#endif
+#if NET_HAS_WIFI
+#include <WiFi.h>
+#include "secrets.h"
+#endif
+
+#define FW_NAME "base_rtk"
+#define VERSION_FW "v1.0.0"
+// Dau thoi gian bien dich: hai ban OTA cung so version van phan biet duoc.
+#define FW_BUILD __DATE__ " " __TIME__
 
 #define GPS_RX 4
 #define GPS_TX 5
@@ -22,24 +33,41 @@
 #define LED_SURVEY_IN 11
 #define LED_PING 7
 
-#define OLED_SDA 2
-#define OLED_SCL 1
-#define OLED_WIDTH 128
-#define OLED_HEIGHT 64
-#define OLED_ADDR 0x3C
-
 #define SURVEY_SEC 20
 #define SURVEY_ACC 4000 // svinAccLimit, đơn vị 0.1mm (4000 = 40cm)
 
-Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
-
+// ---------- Transport ----------
+// Moi duong mang co HAI socket: mot cho MQTT (giu ket noi lien tuc), mot RIENG
+// cho tai firmware. KHONG dung chung — dung chung la treo (bai hoc tu ban
+// IoT-mesh-node).
+#if NET_HAS_GSM
 HardwareSerial modem(1);
 TinyGsm modemGsm(modem);
-TinyGsmClient gsmClient(modemGsm);
-PubSubClient mqtt(gsmClient);
+TinyGsmClient gsmNetClient(modemGsm, 0);
+TinyGsmClient gsmOtaClient(modemGsm, 1); // mux 1: socket thu hai cua BG96
+bool gsmReady = false;                   // da restart + gprsConnect thanh cong
+#endif
+
+#if NET_HAS_WIFI
+WiFiClient wifiNetClient;
+WiFiClient wifiOtaClient;
+#endif
+
+// Duong mang dang thuc su dung. O NET_MODE_GSM/WIFI gia tri nay co dinh sau
+// khi ket noi; chi NET_MODE_AUTO moi doi qua lai luc chay.
+ConnMode activeConnMode = ConnMode::None;
+
+// AUTO khoi tao bang WiFi roi doi luc chay qua setClient(). PHAI co client ngay
+// tu dau: PubSubClient::disconnect()/connect() KHONG kiem tra _client == NULL.
+#if NET_MODE == NET_MODE_GSM
+PubSubClient mqtt(gsmNetClient);
+#else
+PubSubClient mqtt(wifiNetClient);
+#endif
 
 HardwareSerial F9P(2);
 unsigned long lastModemReset = 0;
+unsigned long lastF9pMs = 0; // lan cuoi thay du lieu tu F9P (dung cho self-test)
 
 const char *MQTT_HOST = "103.82.22.78";
 const int MQTT_PORT = 1883;
@@ -47,15 +75,26 @@ const char *MQTT_CLIENT_ID = "cacao_2_rtk_base";
 const char *MQTT_TOPIC = "rtk/rtcm3-2";
 const char *MQTT_CMD_TOPIC = "rtk/cacao_2_rtk_base/cmd";
 const char *MQTT_LOG_TOPIC = "rtk/cacao_2_rtk_base/log";
+const char *MQTT_OTA_STATUS_TOPIC = "rtk/cacao_2_rtk_base/ota";
 
 void switchToFixed();
 void switchToSurveyIn();
 
+// Lenh OTA: "OTA {"url":"http://...","size":1234,"sha256":"..."}"
+// Chi NAP yeu cau — viec tai/flash chay o loop() qua OtaRtk::tick(), khong bao
+// gio chay trong callback MQTT.
+static void otaCommand(const char *arg, size_t len)
+{
+    OtaRtk::handleCommand(arg, len);
+}
+
 const MqttCmd::Entry cmdEntries[] = {
-    {"FIXED", switchToFixed},
-    {"SURVEY", switchToSurveyIn},
+    {"FIXED", switchToFixed, nullptr},
+    {"SURVEY", switchToSurveyIn, nullptr},
     {"RESTART", []()
-     { esp_restart(); }},
+     { esp_restart(); },
+     nullptr},
+    {"OTA", nullptr, otaCommand},
 };
 
 enum ParseState
@@ -87,150 +126,206 @@ bool surveyActive = false;
 float currentAccM = 0.0f;
 uint32_t currentDur = 0;
 
-// ---------- OLED ----------
+// ---------- Network (WiFi / 4G) ----------
 
-void oledDrawHeader(const char *line1, const char *line2)
+const char *connModeName(ConnMode m)
 {
-    oled.fillRect(0, 0, OLED_WIDTH, 22, SSD1306_WHITE);
-    oled.setTextColor(SSD1306_BLACK);
-    oled.setTextSize(1);
-
-    int w1 = strlen(line1) * 6;
-    oled.setCursor((OLED_WIDTH - w1) / 2, 2);
-    oled.print(line1);
-
-    int w2 = strlen(line2) * 6;
-    oled.setCursor((OLED_WIDTH - w2) / 2, 13);
-    oled.print(line2);
-
-    oled.setTextColor(SSD1306_WHITE);
+    switch (m)
+    {
+    case ConnMode::Wifi:
+        return "WIFI";
+    case ConnMode::Gsm:
+        return "4G";
+    default:
+        return "NONE";
+    }
 }
 
-void updateOLED()
+#if NET_HAS_WIFI
+// Khoi dong radio WiFi va bat dau ket noi. Khong cho o day — nguoi goi tu cho.
+void wifiStart()
 {
-    char buf[24];
-    char sub[22];
-    oled.clearDisplay();
-    oled.setTextSize(1);
-
-    if (baseState == FIXED)
-    {
-        oledDrawHeader("FIXED", "(v)  Position locked");
-
-        oled.setCursor(0, 28);
-        snprintf(buf, sizeof(buf), "Acc : %.3f m", fixedAcc / 10000.0f);
-        oled.print(buf);
-
-        oled.setCursor(0, 40);
-        snprintf(buf, sizeof(buf), "Time: %d s", SURVEY_SEC);
-        oled.print(buf);
-
-        oled.drawFastHLine(0, 52, OLED_WIDTH, SSD1306_WHITE);
-        oled.setCursor(0, 55);
-        oled.print(">> Sending RTCM3");
-    }
-    else if (baseState == SURVEY)
-    {
-        snprintf(sub, sizeof(sub), "(*) %lu s / %d s", currentDur, SURVEY_SEC);
-        oledDrawHeader("SURVEY-IN", sub);
-
-        oled.setCursor(0, 28);
-        snprintf(buf, sizeof(buf), "Acc : %.3f m", currentAccM);
-        oled.print(buf);
-
-        oled.setCursor(0, 40);
-        snprintf(buf, sizeof(buf), "Tgt : %.3f m", SURVEY_ACC / 10000.0f);
-        oled.print(buf);
-    }
-    else
-    {
-        oledDrawHeader("BASE RTK STATION", "MODE: IDLE");
-
-        oled.setCursor(0, 32);
-        oled.print("Waiting RTK...");
-    }
-
-    oled.display();
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false); // TAT power-save: giam tre, tang toc tai OTA bulk
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
 }
 
-// ---------- OLED connection screens ----------
+bool wifiUp() { return WiFi.status() == WL_CONNECTED; }
+#endif
 
-void oledConnecting(const char *title, const char *detail)
+#if NET_HAS_GSM
+// Bat modem BG96 va dang ky GPRS. Chi duoc goi o cac mode CO 4G — o
+// NET_MODE_WIFI ham nay khong ton tai, UART modem khong bao gio duoc mo.
+bool gsmStart()
 {
-    char line1[22];
-    snprintf(line1, sizeof(line1), "(~) %s", title);
-
-    oled.clearDisplay();
-    oledDrawHeader(line1, "Connecting...");
-
-    if (detail && strlen(detail) > 0)
-    {
-        oled.setCursor(0, 28);
-        oled.print(detail);
-    }
-
-    oled.setCursor(0, 52);
-    oled.print("Please wait...");
-
-    oled.display();
-}
-
-void oledConnected(const char *title, bool ok, const char *detail1, const char *detail2)
-{
-    char line1[22];
-    snprintf(line1, sizeof(line1), "%s %s", ok ? "[OK]" : "[!!]", title);
-
-    oled.clearDisplay();
-    oledDrawHeader(line1, ok ? "Connected" : "Failed");
-
-    if (detail1 && strlen(detail1) > 0)
-    {
-        oled.setCursor(0, 28);
-        oled.print(detail1);
-    }
-
-    if (detail2 && strlen(detail2) > 0)
-    {
-        oled.setCursor(0, 40);
-        oled.print(detail2);
-    }
-
-    oled.drawFastHLine(0, 52, OLED_WIDTH, SSD1306_WHITE);
-    oled.setCursor(0, 55);
-    oled.print(ok ? ">> Ready" : ">> Check hardware");
-
-    oled.display();
-    delay(1500);
-}
-
-// ---------- GSM / MQTT ----------
-
-void gsmConnect()
-{
-    oledConnecting("4G NETWORK", "APN: v-internet");
-    SerialLog::log("gsm connecting...");
-
     modem.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     delay(2000);
     modemGsm.restart();
     modemGsm.gprsConnect("v-internet", "", "");
-
-    bool ok = modemGsm.isNetworkConnected();
-    SerialLog::log("gsm connected", ok);
-    oledConnected("4G NETWORK", ok, "APN: v-internet", nullptr);
+    gsmReady = modemGsm.isNetworkConnected();
+    SerialLog::log("gsm connected", gsmReady);
+    return gsmReady;
 }
+#endif
+
+// Gan duong mang cho MQTT + OTA. Ngat MQTT truoc khi doi socket.
+void useConnMode(ConnMode m)
+{
+    if (m == activeConnMode)
+        return;
+
+    SerialLog::log("[NET] chuyen transport sang", connModeName(m));
+    if (activeConnMode != ConnMode::None)
+        mqtt.disconnect(); // dong socket cu truoc khi doi
+
+    switch (m)
+    {
+#if NET_HAS_WIFI
+    case ConnMode::Wifi:
+        mqtt.setClient(wifiNetClient);
+        OtaRtk::setClient(wifiOtaClient);
+        break;
+#endif
+#if NET_HAS_GSM
+    case ConnMode::Gsm:
+        mqtt.setClient(gsmNetClient);
+        OtaRtk::setClient(gsmOtaClient);
+        break;
+#endif
+    default:
+        break;
+    }
+    activeConnMode = m;
+}
+
+// Ket noi mang luc boot theo NET_MODE.
+void netConnect()
+{
+#if NET_MODE == NET_MODE_WIFI
+    SerialLog::log("wifi connecting...");
+    wifiStart();
+
+    const unsigned long deadline = millis() + 30000;
+    while (!wifiUp() && (long)(millis() - deadline) < 0)
+        delay(200);
+
+    SerialLog::log("wifi connected", wifiUp(), WiFi.localIP().toString().c_str());
+    useConnMode(ConnMode::Wifi);
+
+#elif NET_MODE == NET_MODE_GSM
+    SerialLog::log("gsm connecting...");
+    gsmStart();
+    useConnMode(ConnMode::Gsm);
+
+#else // NET_MODE_AUTO — thu WiFi truoc, het gio thi xuong 4G
+    SerialLog::log("auto: thu WiFi truoc...");
+    wifiStart();
+
+    const unsigned long deadline = millis() + NET_WIFI_BOOT_TIMEOUT_MS;
+    while (!wifiUp() && (long)(millis() - deadline) < 0)
+        delay(200);
+
+    if (wifiUp())
+    {
+        SerialLog::log("wifi connected", true, WiFi.localIP().toString().c_str());
+        useConnMode(ConnMode::Wifi);
+    }
+    else
+    {
+        SerialLog::log("khong co WiFi -> chuyen 4G");
+        const bool ok = gsmStart();
+        if (ok)
+            useConnMode(ConnMode::Gsm);
+    }
+#endif
+}
+
+#if NET_MODE == NET_MODE_AUTO
+// Goi moi vong loop. WiFi duoc uu tien; mat WiFi thi bat 4G len, WiFi ve thi
+// quay lai WiFi. (Rut gon tu maintainConnectivity() ben IoT-mesh-node-.)
+void maintainConnectivity()
+{
+    if (wifiUp())
+    {
+        useConnMode(ConnMode::Wifi);
+        return;
+    }
+
+    // Mat WiFi: cho radio thu lai ngam, dong thoi dua 4G len thay.
+    static uint32_t lastWifiRecheck = 0;
+    if (millis() - lastWifiRecheck >= NET_WIFI_RECHECK_MS)
+    {
+        lastWifiRecheck = millis();
+        WiFi.reconnect();
+    }
+
+    if (!gsmReady)
+    {
+        // Lan dau thu ngay; cac lan sau moi rate-limit.
+        static bool firstGsmAttempt = true;
+        static uint32_t lastGsmAttempt = 0;
+        if (!firstGsmAttempt && millis() - lastGsmAttempt < NET_GSM_RETRY_INTERVAL_MS)
+            return;
+        firstGsmAttempt = false;
+        lastGsmAttempt = millis();
+        if (!gsmStart())
+            return;
+    }
+
+    useConnMode(ConnMode::Gsm);
+
+    // Kiem tra link GPRS THUA THOT thoi. Goi isGprsConnected() moi vong lap se
+    // spam AT+CGATT?, tranh kenh AT voi PubSubClient va gay false positive "mat
+    // link" -> re-register 4G vo ich. Phai fail 2 lan LIEN TIEP moi tin.
+    static uint32_t lastGprsCheck = 0;
+    static int gprsFailStreak = 0;
+    if (millis() - lastGprsCheck >= NET_GSM_LINK_CHECK_MS)
+    {
+        lastGprsCheck = millis();
+        if (modemGsm.isGprsConnected())
+        {
+            gprsFailStreak = 0;
+        }
+        else if (++gprsFailStreak >= 2)
+        {
+            SerialLog::log("[GSM] mat link GPRS (2 lan lien tiep), se thu lai");
+            gsmReady = false;
+            gprsFailStreak = 0;
+        }
+    }
+}
+#endif
 
 void resetModem()
 {
-    modemGsm.restart();
-    modemGsm.gprsConnect("v-internet", "", "");
+#if NET_HAS_GSM
+    if (activeConnMode == ConnMode::Gsm)
+    {
+        modemGsm.restart();
+        modemGsm.gprsConnect("v-internet", "", "");
+    }
+#endif
+#if NET_HAS_WIFI
+    if (activeConnMode == ConnMode::Wifi)
+    {
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+#endif
     lastModemReset = millis();
+}
+
+// In ten firmware + phien ban dang chay. Goi luc boot (ra Serial) va ngay sau
+// khi MQTT len (ra topic log) — luc boot MQTT chua noi nen log kia khong bay di
+// dau ca.
+static void logFirmwareVersion()
+{
+    SerialLog::log("FW", FW_NAME, VERSION_FW, FW_BUILD);
 }
 
 void mqttConnect()
 {
-    oledConnecting("MQTT SERVER", MQTT_HOST);
-    SerialLog::log("MQTT connecting...");
+    SerialLog::log("MQTT connecting via", connModeName(activeConnMode));
 
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     mqtt.setBufferSize(1024);
@@ -241,17 +336,23 @@ void mqttConnect()
     {
         mqtt.connect(MQTT_CLIENT_ID);
         delay(1000);
+#if NET_MODE == NET_MODE_AUTO
+        maintainConnectivity(); // ca 2 duong deu hong luc boot -> van tu do lai
+#endif
     }
     MqttCmd::subscribe();
 
     SerialLog::log("MQTT connected");
-    oledConnected("MQTT SERVER", true, MQTT_HOST, MQTT_CLIENT_ID);
+    logFirmwareVersion();
 }
 
 void mqttReconnect()
 {
-    SerialLog::log("GPRS connected:", modemGsm.isGprsConnected());
-    SerialLog::log("Attempting MQTT connection...");
+#if NET_HAS_GSM
+    if (activeConnMode == ConnMode::Gsm)
+        SerialLog::log("GPRS connected:", modemGsm.isGprsConnected());
+#endif
+    SerialLog::log("Attempting MQTT connection via", connModeName(activeConnMode));
     int retry = 1;
     while (!mqtt.connected())
     {
@@ -261,6 +362,11 @@ void mqttReconnect()
             retry++;
             delay(1000);
         }
+#if NET_MODE == NET_MODE_AUTO
+        // Duong mang co the doi ngay giua luc dang ket lai — goi o day de
+        // khong ket vo vong tren mot socket da chet.
+        maintainConnectivity();
+#endif
     }
     MqttCmd::subscribe();
 }
@@ -322,10 +428,11 @@ void ubxUart1Enable(bool isOn)
 void setBaseState(BaseState state)
 {
     baseState = state;
+    SerialLog::log("BASE STATE",
+                   state == FIXED ? "FIXED" : (state == SURVEY ? "SURVEY" : "IDLE"));
     bool isSurvey = state == SURVEY;
     ubxUart1Enable(isSurvey);
     digitalWrite(LED_SURVEY_IN, isSurvey);
-    updateOLED();
 }
 
 void switchToFixed()
@@ -468,8 +575,6 @@ void parseUBX(uint8_t *buf, uint16_t len)
 
         SerialLog::log("SVIN", ecefX_cm, ecefY_cm, ecefZ_cm, surveyValid, dur, acc);
 
-        updateOLED();
-
         if (surveyValid && surveyActive == 0 && dur >= SURVEY_SEC)
         {
             switchToFixed();
@@ -495,6 +600,9 @@ void ubxSync(uint8_t *payload, unsigned int plength)
 
 void f9pLoop()
 {
+    if (F9P.available())
+        lastF9pMs = millis();
+
     if (baseState == FIXED)
     {
         int len = F9P.available();
@@ -604,8 +712,12 @@ void _cmdTask(void *pvParameters)
             else if (cmd.startsWith("SURVEY"))
                 switchToSurveyIn();
         }
+#if NET_HAS_GSM
+        // Echo output AT cua modem ra Serial de debug. O NET_MODE_WIFI khong co
+        // doi tuong `modem` — UART modem khong bao gio duoc mo.
         while (modem.available())
             Serial.write(modem.read());
+#endif
 
         static bool lastState = HIGH;
         static unsigned long lastDebounceTime = 0;
@@ -625,28 +737,29 @@ void _cmdTask(void *pvParameters)
 
 // ---------- Setup / Loop ----------
 
+// Dieu kien "anh moi con song" sau OTA. Chua dat trong OTA_SELFTEST_TIMEOUT_MS
+// -> tu rollback ve anh cu.
+//   - MQTT noi lai duoc  : chung to mang + broker OK.
+//   - F9P con ra du lieu : chung to UART GNSS OK (nghia la tram van lam viec).
+// Neu tu luc boot CHUA he thay byte nao tu F9P thi khong lay lam dieu kien,
+// tranh rollback nham khi module GNSS chua duoc cau hinh phat.
+static bool otaHealthy()
+{
+    if (!mqtt.connected())
+        return false;
+    if (lastF9pMs == 0)
+        return true;
+    return (millis() - lastF9pMs) < 30000;
+}
+
 void setup()
 {
     Serial.begin(115200); // luôn bật để SerialLog hoạt động
+    logFirmwareVersion();
 
-    Wire.begin(OLED_SDA, OLED_SCL);
-    if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
-    {
-        SerialLog::log("OLED init failed");
-    }
-    else
-    {
-        oled.clearDisplay();
-        oled.drawBitmap(
-            (OLED_WIDTH - LOGO_W) / 2,
-            (OLED_HEIGHT - LOGO_H) / 2,
-            logo_bitmap, LOGO_W, LOGO_H,
-            SSD1306_WHITE);
-        oled.display();
-        delay(2000);
-        oled.clearDisplay();
-        oled.display();
-    }
+    // Goi SOM: phat hien anh dang chay co phai ban vua OTA (pending-verify) hay
+    // khong, va bat dong ho self-test.
+    OtaSelfTest::begin(OTA_SELFTEST_TIMEOUT_MS);
 
     F9P.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
 
@@ -662,20 +775,42 @@ void setup()
         delay(50);
     }
 
-    updateOLED();
-
     xTaskCreatePinnedToCore(_cmdTask, "CMDTask", 8192, NULL, 1, NULL, PRO_CPU_NUM);
 
-    gsmConnect();
+    // PHAI goi TRUOC netConnect(): useConnMode() ben trong netConnect() se goi
+    // OtaRtk::setClient() de gan socket dung voi duong mang duoc chon.
+#if NET_MODE == NET_MODE_GSM
+    OtaRtk::begin(mqtt, gsmOtaClient, MQTT_OTA_STATUS_TOPIC);
+#else
+    OtaRtk::begin(mqtt, wifiOtaClient, MQTT_OTA_STATUS_TOPIC);
+#endif
+
+    netConnect();
     mqttConnect();
 }
 
 void loop()
 {
+#if NET_MODE == NET_MODE_AUTO
+    maintainConnectivity(); // WiFi uu tien, mat WiFi thi tu chuyen 4G
+#endif
+
     if (!mqtt.connected())
         mqttReconnect();
 
     mqtt.loop();
+
+    if (OtaSelfTest::isPendingVerify())
+        OtaSelfTest::poll(otaHealthy());
+
+    // Co yeu cau OTA -> tam ngung bom RTCM3 (tai firmware chiem tron loop vai
+    // chuc giay den vai phut; rover se mat hieu chinh trong khoang do).
+    if (OtaRtk::busy())
+    {
+        OtaRtk::tick();
+        return;
+    }
+
     f9pLoop();
 
     if (millis() - lastModemReset > 6UL * 3600 * 1000)

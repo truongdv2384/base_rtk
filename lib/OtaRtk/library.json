@@ -1,0 +1,10 @@
+{
+  "name": "OtaRtk",
+  "version": "0.1.0",
+  "description": "OTA cho tram RTK base: MQTT cmd -> HTTP stream (4G/WiFi) -> Update.write + SHA-256 -> rollback self-test",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "dependencies": {
+    "OtaCommon": "*"
+  }
+}
