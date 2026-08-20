@@ -1,0 +1,11 @@
+{
+  "name": "rtk-mqtt-cli",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node rtk-mqtt.js"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.1"
+  }
+}

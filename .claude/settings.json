@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"\\\\[[0-9]\\\\{3,\\\\}\\\\]\\\\|malloc\\\\|setBufferSize\\\\|MQTT_MAX\\\\|uint8_t buf\\\\|static.*\\\\[\" src/base_rtk.cpp)"
+    ]
+  }
+}

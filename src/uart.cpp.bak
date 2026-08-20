@@ -1,9 +1,9 @@
 
 #include <Arduino.h>
 
-#define GPS_RX 5
-#define GPS_TX 4
-#define GPS_BAUD 115200
+#define GPS_RX 4
+#define GPS_TX 5
+#define GPS_BAUD 38400
 
 HardwareSerial F9P_uart(2);
 
